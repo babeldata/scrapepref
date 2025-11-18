@@ -264,25 +264,94 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
             f.write(html)
         
         # Analyser la structure HTML du site
-        # Note: Cette structure doit être adaptée selon le site réel
-        # Chercher les éléments contenant les arrêtés
-        arretes_elements = soup.find_all(['article', 'div'], class_=re.compile(r'arret|item|card', re.I))
+        # Stratégie : être plus sélectif pour éviter de trouver trop d'éléments non pertinents
         
+        # Méthode 1 : Chercher des éléments avec des classes spécifiques aux arrêtés
+        arretes_elements = []
+        seen_hrefs = set()
+        
+        specific_elements = soup.find_all(['article', 'div', 'li'], 
+                                         class_=re.compile(r'node.*decree|arret|item.*arrete', re.I))
+        for elem in specific_elements:
+            link = elem.find('a', href=True)
+            if link:
+                href = link.get('href', '')
+                if href and href not in seen_hrefs:
+                    text = elem.get_text(strip=True)
+                    # Vérifier que c'est vraiment un arrêté
+                    if len(text) > 20 and ('arrêté' in text.lower() or 'arrete' in text.lower()):
+                        # Vérifier qu'il y a un numéro d'arrêté ou une date (signe d'un vrai arrêté)
+                        has_number = re.search(r'\d{4}[\s_-]*\d{3,}', text)
+                        has_date = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text)
+                        if has_number or has_date:
+                            arretes_elements.append(elem)
+                            seen_hrefs.add(href)
+        
+        # Méthode 2 : Si on n'a pas assez, chercher les liens vers des arrêtés/PDFs
+        if len(arretes_elements) < 10:
+            arretes_links = soup.find_all('a', href=re.compile(r'arret', re.I))
+            
+            for link in arretes_links:
+                href = link.get('href', '')
+                if not href or href in seen_hrefs:
+                    continue
+                
+                # Vérifier que le lien pointe vers un arrêté (pas juste un menu)
+                href_lower = href.lower()
+                if '/arretes/' in href_lower or ('.pdf' in href_lower and 'arrete' in href_lower):
+                    # Trouver l'élément parent qui contient ce lien (article, div, li, etc.)
+                    parent = link.find_parent(['article', 'div', 'li', 'tr'])
+                    if parent and parent not in arretes_elements:
+                        # Vérifier que l'élément contient du texte significatif (évite les menus)
+                        text = parent.get_text(strip=True)
+                        if len(text) > 20 and ('arrêté' in text.lower() or 'arrete' in text.lower()):
+                            # Vérifier qu'il y a un numéro ou une date
+                            has_number = re.search(r'\d{4}[\s_-]*\d{3,}', text)
+                            has_date = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text)
+                            if has_number or has_date:
+                                arretes_elements.append(parent)
+                                seen_hrefs.add(href)
+        
+        # Si on n'a rien trouvé, fallback sur les éléments avec classes spécifiques
         if not arretes_elements:
-            # Fallback: chercher tous les liens vers des arrêtés
-            arretes_elements = soup.find_all('a', href=re.compile(r'arret', re.I))
+            arretes_elements = soup.find_all(['article', 'div'], class_=re.compile(r'arret|item|card', re.I))
+            # Filtrer pour ne garder que ceux qui ont un lien et du texte significatif
+            arretes_elements = [
+                elem for elem in arretes_elements 
+                if elem.find('a', href=True) and len(elem.get_text(strip=True)) > 20
+            ]
         
         logger.info(f"Page {page_num}: {len(arretes_elements)} éléments trouvés")
         
+        # Statistiques pour le debug
+        skipped_no_link = 0
+        skipped_exception = 0
+        extracted_count = 0
+        
         for element in arretes_elements:
             try:
+                # Vérifier rapidement que l'élément contient un lien valide
+                link_elem = element.find('a', href=True)
+                if not link_elem:
+                    skipped_no_link += 1
+                    continue
+                
                 # Ne pas passer la page pour éviter les conflits de navigation
                 arrete = extract_arrete_info(element, page=None)
                 if arrete:
                     arretes.append(arrete)
+                    extracted_count += 1
+                else:
+                    # Log pour comprendre pourquoi l'extraction a échoué
+                    href = link_elem.get('href', '')
+                    logger.debug(f"Extraction échouée pour lien: {href[:100]}")
             except Exception as e:
-                logger.error(f"Erreur extraction arrêté: {e}")
+                skipped_exception += 1
+                logger.debug(f"Erreur extraction arrêté: {e}")
                 continue
+        
+        if skipped_no_link > 0 or skipped_exception > 0:
+            logger.debug(f"Page {page_num}: {skipped_no_link} sans lien, {skipped_exception} erreurs")
         
         logger.info(f"Page {page_num}: {len(arretes)} arrêtés extraits")
         
@@ -308,63 +377,118 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
         Dictionnaire avec les informations de l'arrêté ou None
     """
     try:
-        # Extraire le titre
-        titre_elem = element.find(['h1', 'h2', 'h3', 'h4', 'a'], class_=re.compile(r'title|titre', re.I))
-        if not titre_elem:
-            titre_elem = element.find(['h1', 'h2', 'h3', 'h4'])
-        if not titre_elem:
-            titre_elem = element.find('a')
+        # Structure du site : les arrêtés sont dans des <a> avec des <div class="node node--type--tc13-decree">
+        # Si l'élément est un <a>, prendre son contenu. Sinon, chercher le <a> parent ou enfant.
+        if element.name == 'a':
+            link_elem = element
+            content_elem = element
+        else:
+            # Chercher le lien dans l'élément ou ses parents
+            link_elem = element.find('a', href=True)
+            if not link_elem:
+                # Peut-être que l'élément parent est le <a>
+                link_elem = element.find_parent('a', href=True)
+                if link_elem:
+                    content_elem = link_elem
+                else:
+                    # Pas de lien trouvé, on ne peut pas extraire
+                    return None
+            else:
+                content_elem = element
         
-        # Extraire le titre - nettoyer pour éviter les mois
-        titre_brut = titre_elem.get_text(strip=True) if titre_elem else ""
+        # Extraire le lien
+        lien = link_elem.get('href', '')
+        if not lien:
+            # Si pas de lien, on peut quand même essayer d'extraire les infos
+            # (certains arrêtés peuvent être affichés sans lien cliquable)
+            lien = ""
+        else:
+            if not lien.startswith('http'):
+                lien = urljoin(BASE_URL, lien)
+        
+        # Extraire le titre - chercher dans plusieurs endroits selon la structure du site
+        titre = ""
+        
+        # Méthode 1 : Chercher dans un <span> (structure typique du site)
+        titre_elem = content_elem.find('span')
+        if titre_elem:
+            titre = titre_elem.get_text(strip=True)
+        
+        # Méthode 2 : Chercher dans les headings
+        if not titre:
+            titre_elem = content_elem.find(['h1', 'h2', 'h3', 'h4'], class_=re.compile(r'title|titre', re.I))
+            if not titre_elem:
+                titre_elem = content_elem.find(['h1', 'h2', 'h3', 'h4'])
+            if titre_elem:
+                titre = titre_elem.get_text(strip=True)
+        
+        # Méthode 3 : Chercher dans le texte de l'élément avec "Arrêté"
+        if not titre or len(titre) < 10:
+            texte_complet = content_elem.get_text(separator=' ', strip=True)
+            # Chercher le titre qui commence par "Arrêté"
+            titre_match = re.search(r'(arrêté[^.]{10,300})', texte_complet, re.IGNORECASE | re.DOTALL)
+            if titre_match:
+                titre = titre_match.group(1).strip()
+        
+        # Méthode 4 : Prendre le texte de l'élément si on n'a toujours rien
+        if not titre or len(titre) < 10:
+            titre = content_elem.get_text(separator=' ', strip=True)
+            # Nettoyer : prendre jusqu'à 200 caractères ou jusqu'à un point
+            if len(titre) > 200:
+                titre = titre[:200].rsplit('.', 1)[0] + '.'
         
         # Si le titre est juste un mois, chercher ailleurs
         mois = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 
                 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre']
-        if titre_brut.lower() in mois:
-            # Chercher le vrai titre dans le contenu ou les éléments enfants
-            titre_elem = element.find(['h1', 'h2', 'h3', 'h4', 'p', 'div'], 
-                                     string=re.compile(r'arrêté', re.I))
-            if titre_elem:
-                titre_brut = titre_elem.get_text(strip=True)
+        if titre.lower().strip() in mois:
+            # Chercher le vrai titre dans le contenu
+            texte_complet = content_elem.get_text(separator=' ', strip=True)
+            titre_match = re.search(r'(arrêté[^.]{10,300})', texte_complet, re.IGNORECASE | re.DOTALL)
+            if titre_match:
+                titre = titre_match.group(1).strip()
+        
+        if not titre or len(titre) < 5:
+            # Dernier recours : utiliser le nom du fichier PDF si disponible
+            if '.pdf' in lien.lower():
+                titre = lien.split('/')[-1].replace('.pdf', '').replace('_', ' ').replace('-', ' ')
             else:
-                # Prendre le premier texte significatif
-                texte_complet = element.get_text(separator=' ', strip=True)
-                # Chercher le titre après "Arrêté"
-                titre_match = re.search(r'(arrêté[^.]{10,200})', texte_complet, re.IGNORECASE)
-                if titre_match:
-                    titre_brut = titre_match.group(1).strip()
-        
-        titre = titre_brut if titre_brut else "Titre non trouvé"
-        
-        # Extraire le lien
-        link_elem = element.find('a', href=True)
-        if not link_elem:
-            return None
-        
-        lien = link_elem['href']
-        if not lien.startswith('http'):
-            lien = urljoin(BASE_URL, lien)
+                titre = "Titre non trouvé"
         
         # Extraire la date - chercher plusieurs formats
         date_publication = ""
-        date_elem = element.find(['time', 'span', 'div'], class_=re.compile(r'date', re.I))
+        
+        # Méthode 1 : Chercher dans les champs de date spécifiques du site
+        date_elem = content_elem.find('div', class_=re.compile(r'field.*decree.*date|decree-date', re.I))
         if date_elem:
-            date_publication = date_elem.get_text(strip=True)
-        else:
-            # Chercher un pattern de date dans le texte (format DD/MM/YYYY ou DD-MM-YYYY)
-            date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', element.get_text())
+            date_text = date_elem.get_text(strip=True)
+            # Extraire la date du texte
+            date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', date_text)
+            if date_match:
+                date_publication = date_match.group(1)
+        
+        # Méthode 2 : Chercher dans les éléments time ou avec classe date
+        if not date_publication:
+            date_elem = content_elem.find(['time', 'span', 'div'], class_=re.compile(r'date', re.I))
+            if date_elem:
+                date_text = date_elem.get_text(strip=True)
+                date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', date_text)
+                if date_match:
+                    date_publication = date_match.group(1)
+        
+        # Méthode 3 : Chercher un pattern de date dans tout le texte
+        if not date_publication:
+            date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', content_elem.get_text())
             if date_match:
                 date_publication = date_match.group(1)
         
         # Extraire un aperçu du contenu depuis l'élément actuel
         contenu = ""
-        contenu_elem = element.find(['div', 'p', 'span'], class_=re.compile(r'content|texte|summary|description', re.I))
+        contenu_elem = content_elem.find(['div', 'p', 'span'], class_=re.compile(r'content|texte|summary|description', re.I))
         if contenu_elem:
             contenu = contenu_elem.get_text(strip=True)
         else:
             # Prendre le texte de l'élément entier comme fallback
-            contenu = element.get_text(separator=' ', strip=True)
+            contenu = content_elem.get_text(separator=' ', strip=True)
         
         # Extraire le numéro d'arrêté (si présent) - chercher dans le titre ET le contenu
         numero_arrete = ""
@@ -378,7 +502,8 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
             numero_arrete = numero_match.group(1).strip().replace('_', '-').replace(' ', '-')
         
         # Nettoyer le titre : ne garder que la partie correspondant à ce numéro d'arrêté
-        if numero_arrete:
+        # (seulement si on a plusieurs arrêtés concaténés)
+        if numero_arrete and len(titre) > 200:
             # Chercher le titre complet de cet arrêté spécifique
             # Pattern : "Arrêté n°XXXX-XXXXX ..." jusqu'au prochain arrêté ou date
             titre_pattern = rf'arrêté\s+n[°o]?\s*{re.escape(numero_arrete)}[^0-9]*?(?=\d{{1,2}}/\d{{1,2}}/\d{{4}}\s*arrêté|arrêté\s+n[°o]?\s*\d{{4}}|$)'
@@ -392,7 +517,8 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
                 titre = re.sub(r'(\s+\d{1,2}/\d{1,2}/\d{4}\s+arrêté).*$', '', titre, flags=re.IGNORECASE)
         
         # Nettoyer le contenu : ne garder que la partie correspondant à cet arrêté
-        if numero_arrete and contenu:
+        # (seulement si on a plusieurs arrêtés concaténés)
+        if numero_arrete and contenu and len(contenu) > 300:
             # Chercher le contenu de cet arrêté spécifique
             contenu_pattern = rf'arrêté\s+n[°o]?\s*{re.escape(numero_arrete)}[^0-9]*?(?=\d{{1,2}}/\d{{1,2}}/\d{{4}}\s*arrêté|arrêté\s+n[°o]?\s*\d{{4}}|$)'
             contenu_match = re.search(contenu_pattern, contenu, re.IGNORECASE | re.DOTALL)
@@ -404,28 +530,34 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
                 # Fallback : prendre jusqu'à la première date suivie d'un autre arrêté
                 contenu = re.sub(r'(\s+\d{1,2}/\d{1,2}/\d{4}\s+arrêté).*$', '', contenu, flags=re.IGNORECASE)
         
-        # Chercher le lien PDF directement dans l'élément actuel
+        # Chercher le lien PDF - sur ce site, le lien PDF est souvent directement dans le <a>
         pdf_url = None
         
-        # Chercher d'abord un lien direct vers un PDF
-        pdf_link_elem = element.find('a', href=re.compile(r'\.pdf', re.I))
-        if pdf_link_elem:
-            pdf_href = pdf_link_elem.get('href', '')
-            if pdf_href:
-                pdf_url = urljoin(BASE_URL, pdf_href)
-        else:
-            # Chercher dans les attributs data-* ou autres
+        # Méthode 1 : Le lien lui-même est un PDF (structure typique du site)
+        if link_elem and '.pdf' in lien.lower():
+            pdf_url = lien
+        
+        # Méthode 2 : Chercher un lien enfant vers un PDF
+        if not pdf_url:
+            pdf_link_elem = content_elem.find('a', href=re.compile(r'\.pdf', re.I))
+            if pdf_link_elem:
+                pdf_href = pdf_link_elem.get('href', '')
+                if pdf_href:
+                    pdf_url = urljoin(BASE_URL, pdf_href)
+        
+        # Méthode 3 : Chercher dans les attributs data-* ou autres
+        if not pdf_url:
             for attr in ['data-pdf', 'data-url', 'data-href', 'data-file']:
-                pdf_attr = element.get(attr, '')
+                pdf_attr = content_elem.get(attr, '')
                 if pdf_attr and '.pdf' in pdf_attr.lower():
                     pdf_url = urljoin(BASE_URL, pdf_attr)
                     break
-            
-            if not pdf_url:
-                # Chercher dans le texte de l'élément
-                pdf_match = re.search(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', str(element))
-                if pdf_match:
-                    pdf_url = urljoin(BASE_URL, pdf_match.group(1))
+        
+        # Méthode 4 : Chercher dans le texte HTML de l'élément
+        if not pdf_url:
+            pdf_match = re.search(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', str(content_elem))
+            if pdf_match:
+                pdf_url = urljoin(BASE_URL, pdf_match.group(1))
         
         # Si on a trouvé un lien, vérifier qu'il ne pointe pas vers une page HTML
         # (certains sites utilisent des URLs sans .pdf qui redirigent vers le PDF)
