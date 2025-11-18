@@ -24,10 +24,14 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     # environment: production  # Décommentez si vous utilisez un environment GitHub
+    permissions:
+      contents: write  # Permissions pour pousser les commits
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,6 +75,19 @@ jobs:
         run: |
           cd src
           python scraper.py
+      
+      - name: Commit CSV files
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/*.csv || true
+          if git diff --staged --quiet; then
+            echo "Aucun changement dans les CSV"
+          else
+            git commit -m "Update CSV files from scraper [skip ci]" || echo "Aucun changement à commiter"
+            git push || echo "Push échoué (peut-être pas de permissions)"
+          fi
       
       - name: Upload CSV as artifact
         uses: actions/upload-artifact@v4

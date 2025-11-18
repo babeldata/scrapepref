@@ -21,6 +21,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
+import requests
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -114,12 +115,11 @@ def upload_pdf_to_s3(s3_client, pdf_path: Path, s3_key: str) -> Optional[str]:
         return None
 
 
-def download_pdf(page, pdf_url: str, output_path: Path) -> bool:
+def download_pdf(pdf_url: str, output_path: Path) -> bool:
     """
-    Télécharge un PDF depuis une URL.
+    Télécharge un PDF depuis une URL en utilisant requests.
     
     Args:
-        page: Page Playwright
         pdf_url: URL du PDF
         output_path: Chemin de sortie
     
@@ -127,18 +127,45 @@ def download_pdf(page, pdf_url: str, output_path: Path) -> bool:
         True si le téléchargement a réussi, False sinon
     """
     try:
-        response = page.goto(pdf_url, wait_until='networkidle', timeout=PDF_DOWNLOAD_TIMEOUT)
-        if response and response.status == 200:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'wb') as f:
-                f.write(response.body())
-            logger.info(f"PDF téléchargé: {output_path}")
-            return True
-        else:
-            logger.warning(f"Erreur téléchargement PDF: status {response.status if response else 'None'}")
-            return False
-    except PlaywrightTimeoutError:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        response = requests.get(pdf_url, headers=headers, timeout=PDF_DOWNLOAD_TIMEOUT / 1000, stream=True)
+        response.raise_for_status()
+        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Télécharger le fichier
+        with open(output_path, 'wb') as f:
+            first_chunk = True
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    if first_chunk:
+                        # Vérifier les magic bytes PDF (%PDF) dans le premier chunk
+                        if chunk[:4] != b'%PDF':
+                            logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {chunk[:4]})")
+                            output_path.unlink()
+                            return False
+                        first_chunk = False
+                    f.write(chunk)
+        
+        # Vérification finale : s'assurer que le fichier est bien un PDF
+        with open(output_path, 'rb') as f:
+            first_bytes = f.read(4)
+            if first_bytes != b'%PDF':
+                logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {first_bytes})")
+                output_path.unlink()
+                return False
+        
+        logger.info(f"PDF téléchargé: {output_path} ({output_path.stat().st_size} bytes)")
+        return True
+        
+    except requests.exceptions.Timeout:
         logger.error(f"Timeout téléchargement PDF: {pdf_url}")
+        return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur téléchargement PDF: {e}")
         return False
     except Exception as e:
         logger.error(f"Erreur téléchargement PDF: {e}")
@@ -568,25 +595,25 @@ def scrape_arretes():
                     pdf_filename = f"{numero_clean}_{arrete['file_hash']}.pdf"
                     pdf_path = data_dir / pdf_filename
                     
-                    # Télécharger le PDF
-                    with sync_playwright() as p:
-                        browser = p.chromium.launch(headless=True)
-                        page = browser.new_page()
-                        if download_pdf(page, arrete['pdf_url'], pdf_path):
-                            # Upload vers S3
-                            s3_key = f"arretes/{annee}/{pdf_filename}"
-                            s3_url = upload_pdf_to_s3(s3_client, pdf_path, s3_key)
-                            if s3_url:
-                                arrete['pdf_s3_url'] = s3_url
-                                arrete['poids_pdf_ko'] = round(pdf_path.stat().st_size / 1024, 2)
-                            # Supprimer le fichier local
-                            pdf_path.unlink()
-                        browser.close()
+                    # Télécharger le PDF (utilise requests au lieu de Playwright)
+                    if download_pdf(arrete['pdf_url'], pdf_path):
+                        # Upload vers S3
+                        s3_key = f"arretes/{annee}/{pdf_filename}"
+                        s3_url = upload_pdf_to_s3(s3_client, pdf_path, s3_key)
+                        if s3_url:
+                            arrete['pdf_s3_url'] = s3_url
+                            arrete['poids_pdf_ko'] = round(pdf_path.stat().st_size / 1024, 2)
+                        # Supprimer le fichier local
+                        pdf_path.unlink()
+                    else:
+                        arrete['pdf_s3_url'] = "ERROR: PDF non téléchargé"
                     
                     time.sleep(SCRAPE_DELAY)
                 
                 except Exception as e:
                     logger.error(f"Erreur traitement PDF {arrete.get('pdf_url')}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
                     arrete['pdf_s3_url'] = "ERROR: PDF non téléchargé"
     
     # Sauvegarder dans CSV

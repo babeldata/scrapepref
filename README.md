@@ -5,13 +5,16 @@ Scraper automatisé pour extraire les arrêtés publiés sur le site de la préf
 ## 🎯 Fonctionnalités
 
 - ✅ Extraction automatique des arrêtés depuis le site de la préfecture de police
-- ✅ Classification automatique des arrêtés de circulation
+- ✅ Classification automatique des arrêtés de circulation (recherche du mot "circulation" dans le titre)
+- ✅ Nettoyage automatique des données (séparation des arrêtés concaténés)
+- ✅ Extraction précise du numéro d'arrêté, titre et date
 - ✅ Téléchargement des PDFs
 - ✅ Upload vers S3 (AWS S3 ou MinIO)
 - ✅ Export CSV avec métadonnées complètes
 - ✅ CSV séparé pour les arrêtés de circulation
 - ✅ Automatisation via GitHub Actions
 - ✅ Mode test (DRY_RUN) sans upload S3
+- ✅ Support Firefox en fallback si Chromium ne fonctionne pas
 
 ## 📋 Prérequis
 
@@ -203,13 +206,13 @@ Vous pouvez aussi lancer manuellement le scraping complet depuis l'interface Git
 
 Colonnes :
 
-* `numero_arrete` : Numéro unique de l'arrêté
-* `titre` : Titre complet de l'arrêté
-* `date_publication` : Date de publication
+* `numero_arrete` : Numéro unique de l'arrêté (format : 2025-01535)
+* `titre` : Titre complet de l'arrêté (nettoyé, sans concaténation avec d'autres arrêtés)
+* `date_publication` : Date de publication (format DD/MM/YYYY)
 * `lien` : URL de la page de l'arrêté
 * `pdf_url` : URL du PDF
-* `is_circulation` : `True` si c'est un arrêté de circulation, `False` sinon
-* `contenu_preview` : Aperçu du contenu (200 premiers caractères)
+* `is_circulation` : `True` si c'est un arrêté de circulation (contient "circulation" dans le titre), `False` sinon
+* `contenu_preview` : Aperçu du contenu (200 premiers caractères, nettoyé)
 * `pdf_s3_url` : URL S3 du PDF (`s3://bucket/arretes/2025/arrete_abc12345.pdf`)
 * `poids_pdf_ko` : Taille du PDF en Ko
 * `date_scrape` : Date et heure du scraping (ISO 8601)
@@ -236,19 +239,11 @@ Le hash MD5 (8 premiers caractères) est ajouté au nom de fichier pour éviter 
 
 ## 🔍 Classification des arrêtés de circulation
 
-Le scraper classe automatiquement les arrêtés selon qu'ils concernent la circulation ou non. La classification se base sur :
+Le scraper classe automatiquement les arrêtés selon qu'ils concernent la circulation ou non. 
 
-1. **Mots-clés** : recherche de termes comme "circulation", "stationnement", "rue", "avenue", "fermeture", "déviation", etc.
-2. **Patterns** : détection de patterns spécifiques comme "fermeture de la rue X", "arrêté de circulation", etc.
-3. **Analyse du contenu** : analyse du titre et du contenu textuel de l'arrêté
+**Méthode simple et efficace** : La classification se base uniquement sur la présence du mot **"circulation"** dans le titre de l'arrêté (insensible à la casse).
 
-Les mots-clés recherchés incluent :
-- Circulation, stationnement, parking
-- Voie, rue, avenue, boulevard, place, route
-- Trafic, déplacement, véhicule, automobile
-- Fermeture, interdiction, déviation, détour
-- Sens unique, sens interdit, contre-sens
-- Pont, tunnel, carrefour, intersection, rond-point
+Un arrêté est classé comme arrêté de circulation si son titre contient le mot "circulation". Cette méthode simple garantit une précision élevée et évite les faux positifs.
 
 ## ⚙️ Configuration avancée
 
@@ -286,11 +281,16 @@ Ces timeouts contrôlent combien de temps Playwright attend avant d'abandonner u
 Pour modifier les critères de classification des arrêtés de circulation, éditez la fonction `is_circulation_arrete()` dans `src/scraper.py` :
 
 ```python
-CIRCULATION_KEYWORDS = [
-    'circulation', 'stationnement', 'parking', 'voie', 'rue', ...
-    # Ajoutez vos propres mots-clés
-]
+def is_circulation_arrete(titre: str, contenu: str = "") -> bool:
+    """
+    Détermine si un arrêté concerne la circulation.
+    Simple : cherche le mot "circulation" dans le titre.
+    """
+    titre_lower = titre.lower()
+    return 'circulation' in titre_lower
 ```
+
+Vous pouvez modifier cette fonction pour ajouter d'autres critères si nécessaire (par exemple, chercher aussi "stationnement" ou d'autres mots-clés).
 
 ## 📊 Statistiques
 
@@ -303,12 +303,15 @@ Statistiques:
   Autres arrêtés: 105
 ```
 
+**Note sur la classification** : Un arrêté est classé comme "circulation" si son titre contient le mot "circulation". Cette méthode simple garantit une précision élevée.
+
 ## 🐛 Problèmes connus
 
 1. **Site lent** : Le site peut être très lent. Les timeouts sont configurés à 90 secondes par défaut.
 2. **Téléchargement PDF** : Certains PDFs peuvent être inaccessibles (document retiré, erreur serveur). Dans ce cas, le scraper enregistre `ERROR: PDF non téléchargé` dans le CSV.
 3. **Rate limiting** : Si trop de requêtes sont faites rapidement, le site peut bloquer temporairement. Ajustez `SCRAPE_DELAY_SECONDS`.
 4. **Structure HTML** : La structure HTML du site peut changer. Utilisez `test_local.py` pour analyser la structure actuelle et adapter les sélecteurs dans `scraper.py`.
+5. **Chromium sur macOS** : Si Chromium crash, le scraper essaie automatiquement Firefox en fallback.
 
 ## 🔧 Dépendances
 
