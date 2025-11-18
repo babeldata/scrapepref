@@ -118,96 +118,130 @@ def upload_pdf_to_s3(s3_client, pdf_path: Path, s3_key: str) -> Optional[str]:
 def download_pdf(pdf_url: str, output_path: Path) -> bool:
     """
     Télécharge un PDF depuis une URL en utilisant requests.
-    Gère les redirections et extrait le vrai lien PDF si l'URL pointe vers une page HTML.
-    
+    Gère les redirections JavaScript utilisées par le site pour la protection anti-bot.
+
     Args:
         pdf_url: URL du PDF
         output_path: Chemin de sortie
-    
+
     Returns:
         True si le téléchargement a réussi, False sinon
     """
+    max_redirects = 5
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Connection': 'keep-alive',
+    }
+
+    session = requests.Session()
+    session.headers.update(headers)
+
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/pdf,application/octet-stream,*/*'
-        }
-        
-        # Première tentative : télécharger directement
-        response = requests.get(pdf_url, headers=headers, timeout=PDF_DOWNLOAD_TIMEOUT / 1000, 
-                               stream=True, allow_redirects=True)
-        response.raise_for_status()
-        
-        # Vérifier le Content-Type
-        content_type = response.headers.get('Content-Type', '').lower()
-        
-        # Si c'est du HTML, essayer d'extraire le vrai lien PDF
-        if 'text/html' in content_type or 'html' in content_type:
-            logger.info(f"L'URL pointe vers du HTML, extraction du vrai lien PDF...")
-            html_content = response.text
-            
-            # Chercher un lien PDF dans le HTML
-            soup = BeautifulSoup(html_content, 'lxml')
-            
-            # Chercher un lien direct vers un PDF
-            pdf_link = soup.find('a', href=re.compile(r'\.pdf', re.I))
-            if not pdf_link:
-                # Chercher dans les iframes ou objets
-                iframe = soup.find('iframe', src=re.compile(r'\.pdf', re.I))
-                if iframe:
-                    pdf_link = iframe
-                    pdf_href = iframe.get('src')
-                else:
-                    # Chercher un pattern dans le HTML
-                    pdf_match = re.search(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', html_content, re.IGNORECASE)
-                    if pdf_match:
-                        pdf_href = pdf_match.group(1)
-                    else:
-                        logger.warning(f"Aucun lien PDF trouvé dans la page HTML: {pdf_url}")
-                        return False
-            else:
-                pdf_href = pdf_link.get('href')
-            
-            # Construire l'URL complète
-            if pdf_href:
-                if not pdf_href.startswith('http'):
-                    pdf_url = urljoin(pdf_url, pdf_href)
-                else:
-                    pdf_url = pdf_href
-                
-                logger.info(f"Nouveau lien PDF trouvé: {pdf_url}")
-                # Réessayer avec la nouvelle URL
-                response = requests.get(pdf_url, headers=headers, timeout=PDF_DOWNLOAD_TIMEOUT / 1000, 
-                                       stream=True, allow_redirects=True)
-                response.raise_for_status()
-        
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Télécharger le fichier
-        with open(output_path, 'wb') as f:
-            first_chunk = True
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    if first_chunk:
-                        # Vérifier les magic bytes PDF (%PDF) dans le premier chunk
-                        if chunk[:4] != b'%PDF':
-                            logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {chunk[:4]}, URL: {pdf_url})")
-                            output_path.unlink()
-                            return False
-                        first_chunk = False
-                    f.write(chunk)
-        
-        # Vérification finale : s'assurer que le fichier est bien un PDF
-        with open(output_path, 'rb') as f:
-            first_bytes = f.read(4)
-            if first_bytes != b'%PDF':
-                logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {first_bytes}, URL: {pdf_url})")
-                output_path.unlink()
+        # Étape 1: Obtenir un cookie de session depuis la page d'accueil
+        parsed_url = urlparse(pdf_url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        try:
+            session.get(base_url, timeout=10)
+        except Exception as e:
+            logger.debug(f"Impossible d'initialiser la session: {e}")
+
+        # Étape 2: Suivre les redirections JavaScript
+        current_url = pdf_url
+        redirect_count = 0
+
+        while redirect_count < max_redirects:
+            response = session.get(current_url, timeout=PDF_DOWNLOAD_TIMEOUT / 1000,
+                                  stream=False, allow_redirects=True)
+            response.raise_for_status()
+
+            content_type = response.headers.get('Content-Type', '').lower()
+
+            # Si c'est un PDF, on a terminé!
+            if 'application/pdf' in content_type or 'application/octet-stream' in content_type:
+                # Vérifier les magic bytes
+                if response.content[:4] != b'%PDF':
+                    logger.warning(f"Le contenu n'est pas un PDF valide (magic bytes: {response.content[:4]}, URL: {current_url})")
+                    return False
+
+                # Sauvegarder le PDF
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(response.content)
+
+                logger.info(f"PDF téléchargé: {output_path} ({output_path.stat().st_size} bytes)")
+                return True
+
+            # Si c'est du HTML, chercher une redirection JavaScript
+            elif 'text/html' in content_type:
+                soup = BeautifulSoup(response.text, 'lxml')
+
+                # Méthode 1: Chercher window.location dans les scripts
+                redirect_url = None
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    script_text = script.get_text()
+
+                    # window.location.href = '/redirect_...'
+                    match = re.search(r"window\.location\.href\s*=\s*['\"]([^'\"]+)['\"]", script_text)
+                    if match:
+                        redirect_url = match.group(1)
+                        break
+
+                    # window.location = '/redirect_...'
+                    match = re.search(r"window\.location\s*=\s*['\"]([^'\"]+)['\"]", script_text)
+                    if match:
+                        redirect_url = match.group(1)
+                        break
+
+                if redirect_url:
+                    # Construire l'URL complète
+                    if not redirect_url.startswith('http'):
+                        redirect_url = urljoin(current_url, redirect_url)
+
+                    logger.debug(f"Redirection JavaScript trouvée: {redirect_url}")
+                    current_url = redirect_url
+                    redirect_count += 1
+                    time.sleep(0.5)  # Petit délai pour ne pas être bloqué
+                    continue
+
+                # Méthode 2: Chercher une balise meta refresh
+                meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
+                if meta_refresh:
+                    content = meta_refresh.get('content', '')
+                    match = re.search(r'url=([^\s;]+)', content, re.I)
+                    if match:
+                        redirect_url = match.group(1)
+                        if not redirect_url.startswith('http'):
+                            redirect_url = urljoin(current_url, redirect_url)
+                        logger.debug(f"Meta refresh trouvé: {redirect_url}")
+                        current_url = redirect_url
+                        redirect_count += 1
+                        time.sleep(0.5)
+                        continue
+
+                # Méthode 3: Chercher un lien PDF dans le HTML
+                pdf_link = soup.find('a', href=re.compile(r'\.pdf', re.I))
+                if pdf_link:
+                    redirect_url = pdf_link.get('href')
+                    if not redirect_url.startswith('http'):
+                        redirect_url = urljoin(current_url, redirect_url)
+                    logger.debug(f"Lien PDF trouvé: {redirect_url}")
+                    current_url = redirect_url
+                    redirect_count += 1
+                    time.sleep(0.5)
+                    continue
+
+                logger.warning(f"Aucune redirection trouvée dans le HTML: {pdf_url}")
                 return False
-        
-        logger.info(f"PDF téléchargé: {output_path} ({output_path.stat().st_size} bytes)")
-        return True
-        
+            else:
+                logger.warning(f"Type de contenu inattendu: {content_type}")
+                return False
+
+        logger.warning(f"Nombre maximum de redirections atteint ({max_redirects}): {pdf_url}")
+        return False
+
     except requests.exceptions.Timeout:
         logger.error(f"Timeout téléchargement PDF: {pdf_url}")
         return False
