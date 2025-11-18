@@ -265,56 +265,35 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
         
         # Analyser la structure HTML du site
         # Les arrêtés sont dans des <div class="node node--type--tc13-decree ...">
-        # Ces divs sont généralement à l'intérieur d'un <a> parent
+        # Ces divs sont à l'intérieur d'un <a> parent qui pointe vers un PDF
+        # Structure : <a href="...pdf"><div class="node node--type--tc13-decree ...">...</div></a>
         
         arretes_elements = []
         seen_hrefs = set()
         
-        # Méthode 1 : Cibler spécifiquement les divs avec les classes node et node--type--tc13-decree
-        # C'est la structure exacte du site selon l'utilisateur
-        specific_elements = soup.find_all('div', class_=lambda c: c and 'node' in c and 'node--type--tc13-decree' in c)
+        # Méthode simple : chercher tous les liens <a> qui se terminent par .pdf
+        pdf_links = soup.find_all('a', href=re.compile(r'\.pdf$', re.I))
         
-        logger.debug(f"Page {page_num}: {len(specific_elements)} divs node--type--tc13-decree trouvés")
+        logger.debug(f"Page {page_num}: {len(pdf_links)} liens .pdf trouvés")
         
-        for elem in specific_elements:
-            # La structure peut être : <a><div class="node..."> ou <div class="node..."><a>
-            # Chercher d'abord si le parent est un <a>
-            parent_a = elem.find_parent('a', href=True)
-            if parent_a:
-                href = parent_a.get('href', '')
-                if href and href not in seen_hrefs:
-                    # Utiliser le div comme élément de contenu
-                    arretes_elements.append(elem)
-                    seen_hrefs.add(href)
-            else:
-                # Sinon, chercher un lien dans cet élément
-                link = elem.find('a', href=True)
-                if link:
-                    href = link.get('href', '')
-                    if href and href not in seen_hrefs:
-                        arretes_elements.append(elem)
-                        seen_hrefs.add(href)
-                else:
-                    logger.debug(f"Élément node--type--tc13-decree sans lien trouvé")
-        
-        # Méthode 2 : Fallback si on n'a rien trouvé (ne devrait normalement pas arriver)
-        if not arretes_elements:
-            logger.warning(f"Page {page_num}: Aucun div node--type--tc13-decree trouvé, fallback sur recherche générale")
-            # Chercher les liens vers des arrêtés/PDFs
-            arretes_links = soup.find_all('a', href=re.compile(r'arret|\.pdf', re.I))
+        for link in pdf_links:
+            href = link.get('href', '')
+            if not href or href in seen_hrefs:
+                continue
             
-            for link in arretes_links:
-                href = link.get('href', '')
-                if not href or href in seen_hrefs:
-                    continue
-                
-                # Trouver l'élément parent qui contient ce lien
-                parent = link.find_parent(['article', 'div', 'li', 'tr'])
-                if parent and parent not in arretes_elements:
-                    text = parent.get_text(strip=True)
-                    if len(text) > 20 and ('arrêté' in text.lower() or 'arrete' in text.lower()):
-                        arretes_elements.append(parent)
-                        seen_hrefs.add(href)
+            # Chercher le div enfant avec la classe node--type--tc13-decree
+            # La structure est : <a><div class="node node--type--tc13-decree ...">
+            # Utiliser une recherche simple avec BeautifulSoup
+            child_div = link.find('div', class_=re.compile(r'node--type--tc13-decree'))
+            
+            if child_div:
+                # Trouvé le div node--type--tc13-decree dans le lien
+                arretes_elements.append(child_div)
+                seen_hrefs.add(href)
+            else:
+                # Fallback : utiliser le lien lui-même (l'extraction saura gérer)
+                arretes_elements.append(link)
+                seen_hrefs.add(href)
         
         logger.info(f"Page {page_num}: {len(arretes_elements)} éléments trouvés")
         
