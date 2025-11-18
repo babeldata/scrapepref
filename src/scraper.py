@@ -118,6 +118,7 @@ def upload_pdf_to_s3(s3_client, pdf_path: Path, s3_key: str) -> Optional[str]:
 def download_pdf(pdf_url: str, output_path: Path) -> bool:
     """
     Télécharge un PDF depuis une URL en utilisant requests.
+    Gère les redirections et extrait le vrai lien PDF si l'URL pointe vers une page HTML.
     
     Args:
         pdf_url: URL du PDF
@@ -128,11 +129,57 @@ def download_pdf(pdf_url: str, output_path: Path) -> bool:
     """
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/pdf,application/octet-stream,*/*'
         }
         
-        response = requests.get(pdf_url, headers=headers, timeout=PDF_DOWNLOAD_TIMEOUT / 1000, stream=True)
+        # Première tentative : télécharger directement
+        response = requests.get(pdf_url, headers=headers, timeout=PDF_DOWNLOAD_TIMEOUT / 1000, 
+                               stream=True, allow_redirects=True)
         response.raise_for_status()
+        
+        # Vérifier le Content-Type
+        content_type = response.headers.get('Content-Type', '').lower()
+        
+        # Si c'est du HTML, essayer d'extraire le vrai lien PDF
+        if 'text/html' in content_type or 'html' in content_type:
+            logger.info(f"L'URL pointe vers du HTML, extraction du vrai lien PDF...")
+            html_content = response.text
+            
+            # Chercher un lien PDF dans le HTML
+            soup = BeautifulSoup(html_content, 'lxml')
+            
+            # Chercher un lien direct vers un PDF
+            pdf_link = soup.find('a', href=re.compile(r'\.pdf', re.I))
+            if not pdf_link:
+                # Chercher dans les iframes ou objets
+                iframe = soup.find('iframe', src=re.compile(r'\.pdf', re.I))
+                if iframe:
+                    pdf_link = iframe
+                    pdf_href = iframe.get('src')
+                else:
+                    # Chercher un pattern dans le HTML
+                    pdf_match = re.search(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', html_content, re.IGNORECASE)
+                    if pdf_match:
+                        pdf_href = pdf_match.group(1)
+                    else:
+                        logger.warning(f"Aucun lien PDF trouvé dans la page HTML: {pdf_url}")
+                        return False
+            else:
+                pdf_href = pdf_link.get('href')
+            
+            # Construire l'URL complète
+            if pdf_href:
+                if not pdf_href.startswith('http'):
+                    pdf_url = urljoin(pdf_url, pdf_href)
+                else:
+                    pdf_url = pdf_href
+                
+                logger.info(f"Nouveau lien PDF trouvé: {pdf_url}")
+                # Réessayer avec la nouvelle URL
+                response = requests.get(pdf_url, headers=headers, timeout=PDF_DOWNLOAD_TIMEOUT / 1000, 
+                                       stream=True, allow_redirects=True)
+                response.raise_for_status()
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -144,7 +191,7 @@ def download_pdf(pdf_url: str, output_path: Path) -> bool:
                     if first_chunk:
                         # Vérifier les magic bytes PDF (%PDF) dans le premier chunk
                         if chunk[:4] != b'%PDF':
-                            logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {chunk[:4]})")
+                            logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {chunk[:4]}, URL: {pdf_url})")
                             output_path.unlink()
                             return False
                         first_chunk = False
@@ -154,7 +201,7 @@ def download_pdf(pdf_url: str, output_path: Path) -> bool:
         with open(output_path, 'rb') as f:
             first_bytes = f.read(4)
             if first_bytes != b'%PDF':
-                logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {first_bytes})")
+                logger.warning(f"Le fichier téléchargé n'est pas un PDF valide (magic bytes: {first_bytes}, URL: {pdf_url})")
                 output_path.unlink()
                 return False
         
@@ -169,6 +216,8 @@ def download_pdf(pdf_url: str, output_path: Path) -> bool:
         return False
     except Exception as e:
         logger.error(f"Erreur téléchargement PDF: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return False
 
 
@@ -357,14 +406,33 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
         
         # Chercher le lien PDF directement dans l'élément actuel
         pdf_url = None
+        
+        # Chercher d'abord un lien direct vers un PDF
         pdf_link_elem = element.find('a', href=re.compile(r'\.pdf', re.I))
         if pdf_link_elem:
-            pdf_url = urljoin(BASE_URL, pdf_link_elem['href'])
+            pdf_href = pdf_link_elem.get('href', '')
+            if pdf_href:
+                pdf_url = urljoin(BASE_URL, pdf_href)
         else:
-            # Chercher dans le texte de l'élément
-            pdf_match = re.search(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', str(element))
-            if pdf_match:
-                pdf_url = urljoin(BASE_URL, pdf_match.group(1))
+            # Chercher dans les attributs data-* ou autres
+            for attr in ['data-pdf', 'data-url', 'data-href', 'data-file']:
+                pdf_attr = element.get(attr, '')
+                if pdf_attr and '.pdf' in pdf_attr.lower():
+                    pdf_url = urljoin(BASE_URL, pdf_attr)
+                    break
+            
+            if not pdf_url:
+                # Chercher dans le texte de l'élément
+                pdf_match = re.search(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', str(element))
+                if pdf_match:
+                    pdf_url = urljoin(BASE_URL, pdf_match.group(1))
+        
+        # Si on a trouvé un lien, vérifier qu'il ne pointe pas vers une page HTML
+        # (certains sites utilisent des URLs sans .pdf qui redirigent vers le PDF)
+        if pdf_url and not pdf_url.lower().endswith('.pdf'):
+            # C'est peut-être une URL qui redirige vers le PDF, on la garde
+            # La fonction download_pdf gérera l'extraction si c'est du HTML
+            pass
         
         # Classifier l'arrêté
         is_circulation = is_circulation_arrete(titre, contenu)
