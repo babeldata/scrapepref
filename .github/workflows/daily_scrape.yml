@@ -1,0 +1,84 @@
+name: Daily Scrape of Prefecture Arrêtés
+
+on:
+  schedule:
+    # Exécution quotidienne à 6h du matin (heure de Paris, UTC+1)
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: 'Nombre maximum de pages à scraper (0 = toutes)'
+        required: false
+        default: '0'
+        type: string
+      dry_run:
+        description: 'Mode test (sans upload S3)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # environment: production  # Décommentez si vous utilisez un environment GitHub
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        run: |
+          uv pip install --system -r requirements.txt
+          playwright install chromium
+      
+      - name: Configure AWS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "⚠️  AWS credentials non configurées. Mode DRY_RUN activé."
+            export DRY_RUN=true
+          fi
+      
+      - name: Run scraper
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          MAX_PAGES_TO_SCRAPE: ${{ github.event.inputs.max_pages || '0' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          SCRAPE_DELAY_SECONDS: '2'
+          MAX_CONCURRENT_PAGES: '5'
+        run: |
+          cd src
+          python scraper.py
+      
+      - name: Upload CSV as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arretes-data
+          path: |
+            data/*.csv
+            src/scraper.log
+          retention-days: 30
+

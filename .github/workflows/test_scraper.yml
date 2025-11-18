@@ -1,0 +1,82 @@
+name: Test Scraper (Dry Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: 'Nombre de pages à scraper'
+        required: false
+        default: '1'
+        type: string
+      dry_run:
+        description: 'Mode test (sans upload S3)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      max_concurrent:
+        description: 'Pages en parallèle'
+        required: false
+        default: '3'
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        run: |
+          uv pip install --system -r requirements.txt
+          playwright install chromium
+      
+      - name: Run scraper (test mode)
+        env:
+          MAX_PAGES_TO_SCRAPE: ${{ github.event.inputs.max_pages || '1' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          SCRAPE_DELAY_SECONDS: '2'
+          MAX_CONCURRENT_PAGES: ${{ github.event.inputs.max_concurrent || '3' }}
+        run: |
+          cd src
+          python scraper.py
+      
+      - name: Display summary
+        if: always()
+        run: |
+          echo "## 📊 Résumé du test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "data/arretes.csv" ]; then
+            echo "✅ CSV généré avec succès" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            head -5 data/arretes.csv >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Aucun CSV généré" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            data/*.csv
+            data/*.html
+            src/scraper.log
+          retention-days: 7
+
