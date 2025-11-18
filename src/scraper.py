@@ -271,26 +271,36 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
         arretes_elements = []
         seen_hrefs = set()
         
-        # Méthode simple : chercher tous les liens <a> qui se terminent par .pdf
-        pdf_links = soup.find_all('a', href=re.compile(r'\.pdf$', re.I))
+        # Méthode : chercher d'abord les divs node--type--tc13-decree, puis vérifier qu'ils sont dans un <a> avec .pdf
+        # C'est plus précis que de chercher tous les liens PDF
+        # BeautifulSoup stocke les classes comme une liste, donc on peut chercher directement
+        decree_divs = soup.find_all('div', class_=lambda c: c and 'node--type--tc13-decree' in c)
         
-        logger.debug(f"Page {page_num}: {len(pdf_links)} liens .pdf trouvés")
+        logger.debug(f"Page {page_num}: {len(decree_divs)} divs node--type--tc13-decree trouvés")
         
-        for link in pdf_links:
-            href = link.get('href', '')
-            if not href or href in seen_hrefs:
-                continue
+        for div in decree_divs:
+            # Chercher le parent <a> qui contient ce div
+            # La structure est : <a href="...pdf"><div class="node node--type--tc13-decree ...">...</div></a>
+            parent_a = div.find_parent('a', href=True)
             
-            # Chercher le div enfant avec la classe node--type--tc13-decree
-            # La structure est : <a><div class="node node--type--tc13-decree ...">
-            # Utiliser une recherche simple avec BeautifulSoup
-            child_div = link.find('div', class_=re.compile(r'node--type--tc13-decree'))
-            
-            if child_div:
-                # Trouvé le div node--type--tc13-decree dans le lien - c'est un arrêté
-                arretes_elements.append(child_div)
-                seen_hrefs.add(href)
-            # Sinon, ignorer ce lien PDF (ce n'est probablement pas un arrêté)
+            if parent_a:
+                href = parent_a.get('href', '')
+                # Vérifier que le lien se termine par .pdf
+                if href and href.lower().endswith('.pdf') and href not in seen_hrefs:
+                    arretes_elements.append(div)
+                    seen_hrefs.add(href)
+                else:
+                    logger.debug(f"Div node--type--tc13-decree avec parent <a> mais href non-PDF ou déjà vu: {href[:100] if href else 'None'}")
+            else:
+                # Si pas de parent <a>, chercher un <a> enfant avec .pdf
+                child_a = div.find('a', href=re.compile(r'\.pdf$', re.I))
+                if child_a:
+                    href = child_a.get('href', '')
+                    if href and href not in seen_hrefs:
+                        arretes_elements.append(div)
+                        seen_hrefs.add(href)
+                else:
+                    logger.debug(f"Div node--type--tc13-decree sans parent <a> ni enfant <a> avec .pdf")
         
         logger.info(f"Page {page_num}: {len(arretes_elements)} éléments trouvés")
         
@@ -326,7 +336,9 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
                 else:
                     # Log pour comprendre pourquoi l'extraction a échoué
                     href = link_elem.get('href', '')
-                    logger.debug(f"Extraction échouée pour lien: {href[:100]}")
+                    logger.warning(f"Extraction échouée pour lien: {href[:100]}")
+                    # Log aussi le type d'élément pour debug
+                    logger.debug(f"Type d'élément: {element.name}, classes: {element.get('class', [])}")
             except Exception as e:
                 skipped_exception += 1
                 logger.error(f"Erreur extraction arrêté: {e}")
