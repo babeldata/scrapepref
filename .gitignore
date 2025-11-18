@@ -21,7 +21,6 @@ ENV/
 *~
 
 # Data
-data/*.csv
 data/*.html
 data/*.pdf
 data/test_pdfs/
