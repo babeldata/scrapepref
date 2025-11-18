@@ -287,13 +287,10 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
             child_div = link.find('div', class_=re.compile(r'node--type--tc13-decree'))
             
             if child_div:
-                # Trouvé le div node--type--tc13-decree dans le lien
+                # Trouvé le div node--type--tc13-decree dans le lien - c'est un arrêté
                 arretes_elements.append(child_div)
                 seen_hrefs.add(href)
-            else:
-                # Fallback : utiliser le lien lui-même (l'extraction saura gérer)
-                arretes_elements.append(link)
-                seen_hrefs.add(href)
+            # Sinon, ignorer ce lien PDF (ce n'est probablement pas un arrêté)
         
         logger.info(f"Page {page_num}: {len(arretes_elements)} éléments trouvés")
         
@@ -304,10 +301,21 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
         
         for element in arretes_elements:
             try:
-                # Vérifier rapidement que l'élément contient un lien valide
-                link_elem = element.find('a', href=True)
+                # Vérifier rapidement qu'on a un lien
+                # Si l'élément est un div, le lien peut être le parent <a>
+                # Si l'élément est un <a>, c'est le lien lui-même
+                if element.name == 'a':
+                    link_elem = element
+                else:
+                    # Chercher d'abord le parent <a>
+                    link_elem = element.find_parent('a', href=True)
+                    if not link_elem:
+                        # Sinon chercher un <a> enfant
+                        link_elem = element.find('a', href=True)
+                
                 if not link_elem:
                     skipped_no_link += 1
+                    logger.debug(f"Élément sans lien trouvé: {element.name}")
                     continue
                 
                 # Ne pas passer la page pour éviter les conflits de navigation
@@ -321,7 +329,9 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
                     logger.debug(f"Extraction échouée pour lien: {href[:100]}")
             except Exception as e:
                 skipped_exception += 1
-                logger.debug(f"Erreur extraction arrêté: {e}")
+                logger.error(f"Erreur extraction arrêté: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
                 continue
         
         if skipped_no_link > 0 or skipped_exception > 0:
@@ -357,18 +367,19 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
             link_elem = element
             content_elem = element
         else:
-            # Chercher le lien dans l'élément ou ses parents
-            link_elem = element.find('a', href=True)
-            if not link_elem:
-                # Peut-être que l'élément parent est le <a>
-                link_elem = element.find_parent('a', href=True)
+            # Chercher d'abord le parent <a> (structure typique : <a><div>...</div></a>)
+            link_elem = element.find_parent('a', href=True)
+            if link_elem:
+                # Le contenu est dans le div, pas dans le <a>
+                content_elem = element
+            else:
+                # Sinon chercher un <a> enfant
+                link_elem = element.find('a', href=True)
                 if link_elem:
-                    content_elem = link_elem
+                    content_elem = element
                 else:
                     # Pas de lien trouvé, on ne peut pas extraire
                     return None
-            else:
-                content_elem = element
         
         # Extraire le lien
         lien = link_elem.get('href', '')
