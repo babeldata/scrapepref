@@ -264,62 +264,57 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
             f.write(html)
         
         # Analyser la structure HTML du site
-        # Stratégie : être plus sélectif pour éviter de trouver trop d'éléments non pertinents
+        # Les arrêtés sont dans des <div class="node node--type--tc13-decree ...">
+        # Ces divs sont généralement à l'intérieur d'un <a> parent
         
-        # Méthode 1 : Chercher des éléments avec des classes spécifiques aux arrêtés
         arretes_elements = []
         seen_hrefs = set()
         
-        specific_elements = soup.find_all(['article', 'div', 'li'], 
-                                         class_=re.compile(r'node.*decree|arret|item.*arrete', re.I))
-        for elem in specific_elements:
-            link = elem.find('a', href=True)
-            if link:
-                href = link.get('href', '')
-                if href and href not in seen_hrefs:
-                    text = elem.get_text(strip=True)
-                    # Vérifier que c'est vraiment un arrêté
-                    if len(text) > 20 and ('arrêté' in text.lower() or 'arrete' in text.lower()):
-                        # Vérifier qu'il y a un numéro d'arrêté ou une date (signe d'un vrai arrêté)
-                        has_number = re.search(r'\d{4}[\s_-]*\d{3,}', text)
-                        has_date = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text)
-                        if has_number or has_date:
-                            arretes_elements.append(elem)
-                            seen_hrefs.add(href)
+        # Méthode 1 : Cibler spécifiquement les divs avec les classes node et node--type--tc13-decree
+        # C'est la structure exacte du site selon l'utilisateur
+        specific_elements = soup.find_all('div', class_=lambda c: c and 'node' in c and 'node--type--tc13-decree' in c)
         
-        # Méthode 2 : Si on n'a pas assez, chercher les liens vers des arrêtés/PDFs
-        if len(arretes_elements) < 10:
-            arretes_links = soup.find_all('a', href=re.compile(r'arret', re.I))
+        logger.debug(f"Page {page_num}: {len(specific_elements)} divs node--type--tc13-decree trouvés")
+        
+        for elem in specific_elements:
+            # La structure peut être : <a><div class="node..."> ou <div class="node..."><a>
+            # Chercher d'abord si le parent est un <a>
+            parent_a = elem.find_parent('a', href=True)
+            if parent_a:
+                href = parent_a.get('href', '')
+                if href and href not in seen_hrefs:
+                    # Utiliser le div comme élément de contenu
+                    arretes_elements.append(elem)
+                    seen_hrefs.add(href)
+            else:
+                # Sinon, chercher un lien dans cet élément
+                link = elem.find('a', href=True)
+                if link:
+                    href = link.get('href', '')
+                    if href and href not in seen_hrefs:
+                        arretes_elements.append(elem)
+                        seen_hrefs.add(href)
+                else:
+                    logger.debug(f"Élément node--type--tc13-decree sans lien trouvé")
+        
+        # Méthode 2 : Fallback si on n'a rien trouvé (ne devrait normalement pas arriver)
+        if not arretes_elements:
+            logger.warning(f"Page {page_num}: Aucun div node--type--tc13-decree trouvé, fallback sur recherche générale")
+            # Chercher les liens vers des arrêtés/PDFs
+            arretes_links = soup.find_all('a', href=re.compile(r'arret|\.pdf', re.I))
             
             for link in arretes_links:
                 href = link.get('href', '')
                 if not href or href in seen_hrefs:
                     continue
                 
-                # Vérifier que le lien pointe vers un arrêté (pas juste un menu)
-                href_lower = href.lower()
-                if '/arretes/' in href_lower or ('.pdf' in href_lower and 'arrete' in href_lower):
-                    # Trouver l'élément parent qui contient ce lien (article, div, li, etc.)
-                    parent = link.find_parent(['article', 'div', 'li', 'tr'])
-                    if parent and parent not in arretes_elements:
-                        # Vérifier que l'élément contient du texte significatif (évite les menus)
-                        text = parent.get_text(strip=True)
-                        if len(text) > 20 and ('arrêté' in text.lower() or 'arrete' in text.lower()):
-                            # Vérifier qu'il y a un numéro ou une date
-                            has_number = re.search(r'\d{4}[\s_-]*\d{3,}', text)
-                            has_date = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text)
-                            if has_number or has_date:
-                                arretes_elements.append(parent)
-                                seen_hrefs.add(href)
-        
-        # Si on n'a rien trouvé, fallback sur les éléments avec classes spécifiques
-        if not arretes_elements:
-            arretes_elements = soup.find_all(['article', 'div'], class_=re.compile(r'arret|item|card', re.I))
-            # Filtrer pour ne garder que ceux qui ont un lien et du texte significatif
-            arretes_elements = [
-                elem for elem in arretes_elements 
-                if elem.find('a', href=True) and len(elem.get_text(strip=True)) > 20
-            ]
+                # Trouver l'élément parent qui contient ce lien
+                parent = link.find_parent(['article', 'div', 'li', 'tr'])
+                if parent and parent not in arretes_elements:
+                    text = parent.get_text(strip=True)
+                    if len(text) > 20 and ('arrêté' in text.lower() or 'arrete' in text.lower()):
+                        arretes_elements.append(parent)
+                        seen_hrefs.add(href)
         
         logger.info(f"Page {page_num}: {len(arretes_elements)} éléments trouvés")
         
