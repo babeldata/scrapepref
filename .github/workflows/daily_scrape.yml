@@ -76,6 +76,17 @@ jobs:
           cd src
           python scraper.py
       
+      - name: Move CSV files to root data directory
+        if: always()
+        run: |
+          if [ -d "src/data" ] && [ -n "$(ls -A src/data/*.csv 2>/dev/null)" ]; then
+            mkdir -p data
+            cp src/data/*.csv data/ || true
+            echo "Fichiers CSV déplacés de src/data/ vers data/"
+          else
+            echo "Aucun fichier CSV trouvé dans src/data/"
+          fi
+      
       - name: Commit CSV files
         if: always()
         run: |

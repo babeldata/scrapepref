@@ -292,7 +292,8 @@ def extract_arretes_from_page(page, page_num: int) -> List[Dict]:
         soup = BeautifulSoup(html, 'lxml')
         
         # Sauvegarder le HTML pour debug
-        debug_path = Path('data') / f'debug_page_{page_num}.html'
+        project_root = get_project_root()
+        debug_path = project_root / 'data' / f'debug_page_{page_num}.html'
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         with open(debug_path, 'w', encoding='utf-8') as f:
             f.write(html)
@@ -811,7 +812,8 @@ def scrape_arretes():
     
     # Télécharger les PDFs et uploader vers S3
     if s3_client:
-        data_dir = Path('data')
+        project_root = get_project_root()
+        data_dir = project_root / 'data'
         data_dir.mkdir(exist_ok=True)
         
         for arrete in all_arretes:
@@ -863,13 +865,32 @@ def scrape_arretes():
     return all_arretes
 
 
+def get_project_root() -> Path:
+    """Trouve la racine du projet en remontant depuis le répertoire courant."""
+    current = Path(__file__).resolve().parent
+    # Marqueurs de la racine du projet
+    markers = ['.git', 'README.md', 'requirements.txt', 'pyproject.toml']
+    
+    while current != current.parent:
+        if any((current / marker).exists() for marker in markers):
+            return current
+        current = current.parent
+    
+    # Si on ne trouve pas, retourner le répertoire parent de src (si on est dans src)
+    if Path(__file__).parent.name == 'src':
+        return Path(__file__).resolve().parent.parent
+    return Path.cwd()
+
+
 def save_to_csv(arretes: List[Dict]):
     """Sauvegarde les arrêtés dans un fichier CSV."""
     if not arretes:
         logger.warning("Aucun arrêté à sauvegarder")
         return
     
-    csv_path = Path('data') / 'arretes.csv'
+    # Utiliser la racine du projet pour sauvegarder dans data/ à la racine
+    project_root = get_project_root()
+    csv_path = project_root / 'data' / 'arretes.csv'
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Colonnes du CSV
@@ -895,7 +916,7 @@ def save_to_csv(arretes: List[Dict]):
     # Sauvegarder aussi un CSV séparé pour les arrêtés de circulation
     df_circulation = df_new[df_new['is_circulation'] == True]
     if not df_circulation.empty:
-        csv_circulation_path = Path('data') / 'arretes_circulation.csv'
+        csv_circulation_path = project_root / 'data' / 'arretes_circulation.csv'
         if csv_circulation_path.exists():
             df_existing_circ = pd.read_csv(csv_circulation_path)
             df_combined_circ = pd.concat([df_existing_circ, df_new], ignore_index=True)
