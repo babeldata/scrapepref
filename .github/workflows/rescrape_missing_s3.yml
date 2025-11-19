@@ -1,0 +1,94 @@
+name: Rescrape Missing S3 URLs
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Mode test (sans upload S3)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      scrape_delay:
+        description: 'Délai entre téléchargements (secondes)'
+        required: false
+        default: '2'
+        type: string
+
+jobs:
+  rescrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Permissions pour pousser les commits
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        run: |
+          uv pip install --system -r requirements.txt
+      
+      - name: Configure AWS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "⚠️  AWS credentials non configurées. Mode DRY_RUN activé."
+            export DRY_RUN=true
+          fi
+      
+      - name: Run rescrape script
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          SCRAPE_DELAY_SECONDS: ${{ github.event.inputs.scrape_delay || '2' }}
+          PDF_DOWNLOAD_TIMEOUT: '60000'
+        run: |
+          python rescrape_missing_s3.py
+      
+      - name: Commit updated CSV files
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/arretes_circulation.csv || true
+          if git diff --staged --quiet; then
+            echo "Aucun changement dans le CSV"
+          else
+            git commit -m "Update S3 URLs in arretes_circulation.csv [skip ci]" || echo "Aucun changement à commiter"
+            git push || echo "Push échoué (peut-être pas de permissions)"
+          fi
+      
+      - name: Upload logs and CSV as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rescrape-results
+          path: |
+            data/arretes_circulation.csv
+            rescrape_missing_s3.log
+          retention-days: 30
+

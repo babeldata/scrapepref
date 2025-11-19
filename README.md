@@ -200,6 +200,36 @@ Vous pouvez aussi lancer manuellement le scraping complet depuis l'interface Git
 2. Sélectionner `Daily Scrape of Prefecture Arrêtés`
 3. Cliquer sur `Run workflow`
 
+### Rescraping des PDFs manquants (mise à jour des URLs S3)
+
+Si certains arrêtés dans le CSV n'ont pas de lien S3, vous pouvez utiliser le workflow de rescraping pour télécharger et uploader les PDFs manquants :
+
+**Depuis GitHub Actions** :
+
+1. Aller dans l'onglet `Actions`
+2. Sélectionner `Rescrape Missing S3 URLs`
+3. Cliquer sur `Run workflow`
+4. Configurer les paramètres :
+   * **dry_run** : `false` (pour uploader réellement) ou `true` (pour tester)
+   * **scrape_delay** : `2` (délai en secondes entre téléchargements)
+5. Cliquer sur `Run workflow`
+
+Le workflow va :
+* ✅ Identifier les lignes du CSV `arretes_circulation.csv` sans `pdf_s3_url`
+* ✅ Vérifier si les fichiers existent déjà sur S3
+* ✅ Télécharger les PDFs manquants depuis les URLs originales
+* ✅ Uploader les PDFs sur S3
+* ✅ Mettre à jour le CSV avec les nouvelles URLs S3
+* ✅ Commiter automatiquement les changements
+
+**En local** :
+
+```bash
+python rescrape_missing_s3.py
+```
+
+Le script utilise les mêmes variables d'environnement que le scraper principal.
+
 ## 📁 Structure des données
 
 ### CSV (`data/arretes.csv`)
