@@ -89,6 +89,36 @@ def get_s3_client():
     return boto3.client('s3', **config)
 
 
+def check_s3_file_exists(s3_client, s3_key: str) -> Optional[Dict]:
+    """
+    Vérifie si un fichier existe déjà sur S3 et retourne ses métadonnées.
+    
+    Args:
+        s3_client: Client S3
+        s3_key: Clé S3 (chemin dans le bucket)
+    
+    Returns:
+        Dictionnaire avec 'size' (taille en bytes) si le fichier existe, None sinon
+    """
+    if DRY_RUN:
+        logger.debug(f"[DRY_RUN] Vérification simulée: {s3_key}")
+        return None
+    
+    try:
+        response = s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        size = response.get('ContentLength', 0)
+        logger.info(f"Fichier trouvé sur S3: {s3_key} ({size} bytes)")
+        return {'size': size}
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code == '404':
+            logger.debug(f"Fichier non trouvé sur S3: {s3_key}")
+            return None
+        else:
+            logger.warning(f"Erreur vérification S3 {s3_key}: {e}")
+            return None
+
+
 def upload_pdf_to_s3(s3_client, pdf_path: Path, s3_key: str) -> Optional[str]:
     """
     Upload un PDF vers S3.
@@ -604,16 +634,32 @@ def extract_arrete_info(element, page=None) -> Optional[Dict]:
         # Générer un hash pour le fichier
         file_hash = hashlib.md5(f"{numero_arrete}{titre}".encode()).hexdigest()[:8]
         
+        # Éviter la duplication : si lien et pdf_url sont identiques, ne garder que pdf_url
+        # lien devrait être l'URL de la page HTML, pdf_url l'URL du PDF
+        # Normaliser les URLs pour la comparaison (enlever les paramètres de requête, trailing slashes, etc.)
+        lien_normalized = lien.rstrip('/').split('?')[0].split('#')[0] if lien else ""
+        pdf_url_normalized = pdf_url.rstrip('/').split('?')[0].split('#')[0] if pdf_url else ""
+        
+        if pdf_url and lien_normalized and lien_normalized == pdf_url_normalized:
+            # Si le lien pointe directement vers le PDF, on garde seulement pdf_url
+            # et on met lien à vide pour éviter la duplication dans le CSV
+            lien_html = ""
+        else:
+            # Si le lien ne pointe pas vers un PDF, c'est probablement une page HTML
+            lien_html = lien
+        
         arrete = {
             'numero_arrete': numero_arrete,
             'titre': titre,
             'date_publication': date_publication,
-            'lien': lien,
+            'lien': lien_html,
             'pdf_url': pdf_url or "",
             'is_circulation': is_circulation,
             'contenu_preview': contenu[:200] if contenu else "",  # Premiers 200 caractères
             'file_hash': file_hash,
-            'date_scrape': datetime.now().isoformat()
+            'date_scrape': datetime.now().isoformat(),
+            'pdf_s3_url': "",  # Initialisé à vide, sera rempli après upload S3
+            'poids_pdf_ko': ""  # Initialisé à vide, sera rempli après téléchargement
         }
         
         return arrete
@@ -824,22 +870,58 @@ def scrape_arretes():
                     if not numero_clean:
                         numero_clean = "arrete"
                     
-                    annee = datetime.now().year
                     pdf_filename = f"{numero_clean}_{arrete['file_hash']}.pdf"
-                    pdf_path = data_dir / pdf_filename
                     
-                    # Télécharger le PDF (utilise requests au lieu de Playwright)
-                    if download_pdf(arrete['pdf_url'], pdf_path):
-                        # Upload vers S3
+                    # Essayer d'extraire l'année depuis la date de publication
+                    annee_publication = datetime.now().year
+                    if arrete.get('date_publication'):
+                        date_match = re.search(r'(\d{4})', arrete['date_publication'])
+                        if date_match:
+                            annee_publication = int(date_match.group(1))
+                    
+                    # Chercher le fichier dans plusieurs années possibles
+                    annees_a_verifier = [annee_publication]
+                    annee_actuelle = datetime.now().year
+                    if annee_actuelle not in annees_a_verifier:
+                        annees_a_verifier.append(annee_actuelle)
+                    if annee_actuelle - 1 not in annees_a_verifier:
+                        annees_a_verifier.append(annee_actuelle - 1)
+                    
+                    # Vérifier si le fichier existe déjà sur S3 (dans une des années possibles)
+                    s3_file_info = None
+                    annee_trouvee = None
+                    for annee in annees_a_verifier:
                         s3_key = f"arretes/{annee}/{pdf_filename}"
-                        s3_url = upload_pdf_to_s3(s3_client, pdf_path, s3_key)
-                        if s3_url:
-                            arrete['pdf_s3_url'] = s3_url
-                            arrete['poids_pdf_ko'] = round(pdf_path.stat().st_size / 1024, 2)
-                        # Supprimer le fichier local
-                        pdf_path.unlink()
+                        s3_file_info = check_s3_file_exists(s3_client, s3_key)
+                        if s3_file_info:
+                            annee_trouvee = annee
+                            break
+                    
+                    # Utiliser l'année trouvée ou l'année de publication par défaut
+                    annee = annee_trouvee if annee_trouvee else annee_publication
+                    s3_key = f"arretes/{annee}/{pdf_filename}"
+                    
+                    if s3_file_info:
+                        # Le fichier existe déjà, générer l'URL S3 sans télécharger
+                        s3_url = f"s3://{S3_BUCKET_NAME}/{s3_key}"
+                        arrete['pdf_s3_url'] = s3_url
+                        arrete['poids_pdf_ko'] = round(s3_file_info['size'] / 1024, 2)
+                        logger.info(f"Fichier déjà présent sur S3, URL générée: {s3_url}")
                     else:
-                        arrete['pdf_s3_url'] = "ERROR: PDF non téléchargé"
+                        # Le fichier n'existe pas, télécharger et uploader
+                        pdf_path = data_dir / pdf_filename
+                        
+                        # Télécharger le PDF (utilise requests au lieu de Playwright)
+                        if download_pdf(arrete['pdf_url'], pdf_path):
+                            # Upload vers S3
+                            s3_url = upload_pdf_to_s3(s3_client, pdf_path, s3_key)
+                            if s3_url:
+                                arrete['pdf_s3_url'] = s3_url
+                                arrete['poids_pdf_ko'] = round(pdf_path.stat().st_size / 1024, 2)
+                            # Supprimer le fichier local
+                            pdf_path.unlink()
+                        else:
+                            arrete['pdf_s3_url'] = "ERROR: PDF non téléchargé"
                     
                     time.sleep(SCRAPE_DELAY)
                 
